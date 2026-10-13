@@ -7,6 +7,7 @@ Variáveis de ambiente:
   AVA_DOWNLOAD_DIR        pasta de destino dos downloads (padrão ~/FURG)
   AVA_MAX_MB              tamanho máximo por arquivo (padrão 300)
 """
+import html as htmllib
 import json
 import logging
 import os
@@ -69,6 +70,38 @@ def call(fn: str, **params):
     return out
 
 
+def _text(h) -> str:
+    """HTML do Moodle -> texto simples (mantém quebras de linha e links)."""
+    if not h:
+        return ""
+    h = re.sub(r"(?is)<(script|style).*?</\1>", "", h)
+    h = re.sub(r"(?is)<a\b[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", r"\2 (\1)", h)
+    h = re.sub(r"(?i)<br\s*/?>|</(p|div|li|tr|h[1-6])>", "\n", h)
+    h = re.sub(r"(?i)<li[^>]*>", "- ", h)
+    h = re.sub(r"<[^>]+>", "", h)
+    h = htmllib.unescape(h).replace("\xa0", " ")
+    return re.sub(r"\n\s*\n+", "\n\n", re.sub(r"[ \t]+", " ", h)).strip()
+
+
+def _auth_url(url: str) -> str:
+    """Acrescenta o token a uma URL de arquivo do AVA, recusando outros hosts."""
+    u, base = urlsplit(url), urlsplit(BASE)
+    if u.scheme != "https" or u.netloc != base.netloc:
+        raise RuntimeError(f"Só acesso arquivos de {base.netloc} (o token não sai deste host).")
+    if "/pluginfile.php/" in u.path and "/webservice/" not in u.path:
+        u = u._replace(path=u.path.replace("/pluginfile.php/", "/webservice/pluginfile.php/", 1))
+    q = dict(parse_qsl(u.query))
+    q["token"] = _token()
+    return urlunsplit(u._replace(query=urlencode(q)))
+
+
+def _fetch_text(url: str, limit: int = 1_000_000) -> str:
+    r = httpx.get(_auth_url(url), timeout=60, follow_redirects=False)
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}")
+    return _text(r.content[:limit].decode(r.encoding or "utf-8", errors="replace"))
+
+
 def _userid() -> int:
     if "uid" not in _state:
         _state["uid"] = call("core_webservice_get_site_info")["userid"]
@@ -98,19 +131,79 @@ def list_courses() -> str:
                 "progresso": c.get("progress"), "fim": _ts(c.get("enddate"))} for c in cs])
 
 
+def _module(m: dict, with_text: bool) -> dict:
+    e = {"id": m["id"], "tipo": m["modname"], "nome": m["name"], "url": m.get("url")}
+    if m.get("description"):
+        e["descricao"] = _text(m["description"])
+    cs = m.get("contents") or []
+    if m["modname"] == "url" and cs:
+        e["link_externo"] = cs[0].get("fileurl")
+    files = [{"nome": f["filename"], "tamanho": f.get("filesize"), "url": f["fileurl"]}
+             for f in cs if f.get("type") == "file" and f.get("fileurl")]
+    if files:
+        e["arquivos"] = files
+    if with_text and m["modname"] == "book":
+        titles = {}
+        for f in cs:  # o índice vem como JSON em type=content
+            if f.get("type") == "content":
+                try:
+                    titles = {c["href"]: c["title"] for c in json.loads(f.get("content") or "[]")}
+                except (ValueError, KeyError, TypeError):
+                    pass
+        chapters = [f for f in cs if f.get("type") == "file" and f.get("fileurl")
+                    and f["filename"].lower().endswith(".html")]
+        txt = []
+        for f in chapters[:40]:
+            key = (f.get("filepath") or "/").strip("/") + "/" + f["filename"]
+            try:
+                body = _fetch_text(f["fileurl"])
+            except Exception as ex:
+                body = f"(erro ao ler capítulo: {ex})"
+            txt.append((f"## {titles[key]}\n" if key in titles else "") + body)
+        if txt:
+            e["texto"] = "\n\n".join(txt)
+    return e
+
+
 @mcp.tool()
 def course_contents(course_id: int) -> str:
-    """Seções e atividades/recursos de uma disciplina (com URLs de arquivos)."""
+    """Visão geral de uma disciplina: tópicos (com o texto de resumo de cada um), atividades,
+    descrições, links externos e arquivos (com URLs). Para ler um tópico em detalhe, use read_topic."""
     out = []
-    for s in call("core_course_get_contents", courseid=course_id):
+    for i, s in enumerate(call("core_course_get_contents", courseid=course_id)):
+        out.append({"n": s.get("section", i), "secao": s["name"], "resumo": _text(s.get("summary")),
+                    "itens": [_module(m, False) for m in s.get("modules", [])]})
+    return _j(out)
+
+
+@mcp.tool()
+def read_topic(course_id: int, topic: str = "") -> str:
+    """Lê o CONTEÚDO de um tópico/seção de uma disciplina: texto do resumo, rótulos e descrições
+    de atividades, páginas e capítulos de livros, links externos e lista de arquivos.
+    topic = número da seção (ex. "3") ou parte do nome (ex. "Semana 2", "Listas"). Vazio = todos os tópicos."""
+    secs = call("core_course_get_contents", courseid=course_id)
+    t = topic.strip().lower()
+    if t:
+        pick = [s for s in secs if str(s.get("section")) == t or t in s["name"].lower()]
+        if not pick:
+            return _j({"erro": f"Tópico '{topic}' não encontrado", "topicos": [f"{s.get('section')}: {s['name']}" for s in secs]})
+    else:
+        pick = secs
+    pages = {}
+    try:
+        for p in call("mod_page_get_pages_by_courses", courseids=[course_id]).get("pages", []):
+            pages[p["coursemodule"]] = _text(p.get("content"))
+    except RuntimeError:
+        pass  # função pode estar desativada; segue sem o texto das páginas
+    out = []
+    for s in pick:
         mods = []
         for m in s.get("modules", []):
-            e = {"id": m["id"], "tipo": m["modname"], "nome": m["name"], "url": m.get("url")}
-            if m.get("contents"):
-                e["arquivos"] = [{"nome": f["filename"], "tamanho": f.get("filesize"),
-                                  "url": f["fileurl"]} for f in m["contents"] if f.get("fileurl")]
+            e = _module(m, True)
+            if m["id"] in pages:
+                e["texto"] = pages[m["id"]]
             mods.append(e)
-        out.append({"secao": s["name"], "itens": mods})
+        out.append({"n": s.get("section"), "secao": s["name"], "resumo": _text(s.get("summary")), "itens": mods})
     return _j(out)
 
 
@@ -190,15 +283,7 @@ def _dest_dir(sub: str) -> Path:
 
 def _download(url: str, dest: Path, filename: str | None = None) -> dict:
     """Baixa um arquivo do AVA (mesmo host do AVA_URL) autenticando com o token."""
-    u, base = urlsplit(url), urlsplit(BASE)
-    if u.scheme != "https" or u.netloc != base.netloc:
-        raise RuntimeError(f"Só baixo arquivos de {base.netloc} (o token não sai deste host).")
-    if "/pluginfile.php/" in u.path and "/webservice/" not in u.path:
-        u = u._replace(path=u.path.replace("/pluginfile.php/", "/webservice/pluginfile.php/", 1))
-    q = dict(parse_qsl(u.query))
-    q["token"] = _token()
-    q.setdefault("forcedownload", "1")
-    full = urlunsplit(u._replace(query=urlencode(q)))
+    full = _auth_url(url) + "&forcedownload=1"
     name = _safe(filename or Path(urlparse(url).path).name or "arquivo")
     target = dest / name
     tmp = target.with_suffix(target.suffix + ".part")
