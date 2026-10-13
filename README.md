@@ -35,6 +35,8 @@ e qualquer outro cliente que rode servidores MCP locais.
 | `forum_discussions` | Avisos e discussões recentes dos fóruns |
 | `notifications` | Notificações do AVA |
 | `search_courses` | Busca disciplinas no catálogo |
+| `download_file` | Baixa um arquivo do AVA (URL de `course_contents`) para a sua pasta de downloads |
+| `download_course_files` | Baixa todos os arquivos de uma disciplina, organizados por seção; pula o que já foi baixado |
 
 ## 🚀 Instalação
 
@@ -167,12 +169,13 @@ O servidor procura o token nesta ordem:
 2. arquivo `~/.config/furg-ava-mcp/token` (criado pelo `login.py`)
 3. variáveis `AVA_USER` + `AVA_PASSWORD` (faz login sozinho e salva o token)
 
-Outra variável: `AVA_URL` (padrão `https://ava.furg.br`), para usar com outro Moodle.
+Outras variáveis: `AVA_URL` (padrão `https://ava.furg.br`), para usar com outro Moodle; `AVA_DOWNLOAD_DIR` (pasta dos downloads, padrão `~/FURG`) e `AVA_MAX_MB` (limite por arquivo, padrão 300).
 
 > 💡 Prefira o `login.py`. Evita deixar a senha em arquivos de configuração.
 
 ## 🔒 Segurança e privacidade
 
+- Downloads só aceitam URLs do próprio AVA (o token nunca é enviado a outro host) e ficam presos à pasta de downloads, sem escapar com `../`.
 - Tudo roda **na sua máquina**. Não existe servidor intermediário.
 - Seu token dá acesso à sua conta. **Nunca compartilhe** o arquivo `token` nem o publique.
 - Para revogar, troque a senha do AVA. O servidor apaga o token inválido e pede login de novo.
@@ -189,7 +192,7 @@ Outra variável: `AVA_URL` (padrão `https://ava.furg.br`), para usar com outro 
 
 ## 🤝 Contribuindo
 
-PRs e issues são bem-vindos. Ideias: download de arquivos das disciplinas, envio de tarefas, modo HTTP para clientes remotos.
+PRs e issues são bem-vindos. Ideias: envio de tarefas, modo HTTP para clientes remotos.
 
 ## ⚠️ Aviso
 
